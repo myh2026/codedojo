@@ -2,6 +2,8 @@
 
 - 挂载：解法必须先过沙箱测试（验证门），才成为技能；
 - 接管：新任务与技能签名匹配 → 直接复用（仍要重跑测试确认）；
+- **专家叠加**：技能可依赖其他技能（depends_on）——新专家站在旧专家肩上；
+  底层技能退役后，上层技能在下次接管验证中自然失效（级联重学，像人的学习）；
 - 生命周期：使用统计、成功率；连续失败退役（遗忘=降权，档案保留）。
 - 存储：~/.codedojo/skills.json（跨项目持久）。
 """
@@ -15,14 +17,23 @@ from typing import Dict, List, Optional
 STORE = Path.home() / ".codedojo" / "skills.json"
 MATCH_THRESHOLD = 0.42   # 重叠系数阈值（交集/较短方，适合长短不一的任务文本）
 RETIRE_AFTER_FAILS = 3   # 连续失败 N 次退役
+MAX_DEP_DEPTH = 4        # 依赖递归深度上限
+
+
+# 任务模板停用词：所有编码任务都含的措辞，不构成"同族"证据
+STOPWORDS = {
+    "写一", "一个", "函数", "附带", "测试", "带测", "实现", "帮我", "完成", "要求",
+    "以下", "python", "pytest", "代码", "程序", "编写", "给我", "做一个", "个函",
+}
 
 
 def tokenize(text: str) -> set:
-    """中英混合关键词：英文词 + 中文字符 bigram。"""
-    tokens = set(t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}", text) if len(t) >= 2)
+    """中英混合关键词：英文词 + 中文字符 bigram（剔除任务模板停用词）。"""
+    tokens = set(t.lower() for t in re.findall(r"[A-Za-z_][A-Za-z0-9_]{1,}", text)
+                 if len(t) >= 2)
     cjk = re.findall(r"[\u4e00-\u9fff]", text)
     tokens.update(cjk[i] + cjk[i + 1] for i in range(len(cjk) - 1))
-    return tokens
+    return tokens - STOPWORDS
 
 
 class Skill:
@@ -31,6 +42,7 @@ class Skill:
         self.task: str = data["task"]
         self.files: List[dict] = data["files"]            # [{path, content}]
         self.test_cmd: str = data.get("test_cmd", "python -m pytest -q")
+        self.depends_on: List[str] = list(data.get("depends_on", []))  # 依赖的技能 id
         self.uses: int = data.get("uses", 0)
         self.successes: int = data.get("successes", 0)
         self.fails: int = data.get("fails", 0)
@@ -41,10 +53,19 @@ class Skill:
 
     def to_dict(self) -> dict:
         return {"id": self.id, "task": self.task, "files": self.files,
-                "test_cmd": self.test_cmd, "uses": self.uses,
-                "successes": self.successes, "fails": self.fails,
+                "test_cmd": self.test_cmd, "depends_on": self.depends_on,
+                "uses": self.uses, "successes": self.successes, "fails": self.fails,
                 "consecutive_fails": self.consecutive_fails,
                 "retired": self.retired, "created": self.created}
+
+    def module_names(self) -> set:
+        """本技能提供的可 import 模块名（顶层 .py 文件去后缀，不含 tests/）。"""
+        out = set()
+        for f in self.files:
+            p = f["path"]
+            if not p.startswith("tests/") and "/" not in p and p.endswith(".py"):
+                out.add(Path(p).stem)
+        return out
 
     def match_score(self, task_text: str) -> float:
         """重叠系数：|A∩B| / min(|A|,|B|)——任务文本长短不一时比 Jaccard 公平。"""
@@ -90,17 +111,21 @@ class SkillStore:
             json.dumps([s.to_dict() for s in self.skills.values()],
                        ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def mount(self, task: str, files: List[dict], test_cmd: str) -> Skill:
-        """挂载（调用方须已通过验证门）。同族已有技能 -> 原位升级（去重合并）。"""
+    def mount(self, task: str, files: List[dict], test_cmd: str,
+              depends_on: Optional[List[str]] = None) -> Skill:
+        """挂载（调用方须已通过验证门）。同族已有技能 -> 原位升级（依赖取并集）。"""
+        deps = list(dict.fromkeys(depends_on or []))
         for existing in list(self.skills.values()):
             if not existing.retired and existing.match_score(task) >= MATCH_THRESHOLD:
                 existing.files = files
                 existing.test_cmd = test_cmd
+                existing.depends_on = list(dict.fromkeys(existing.depends_on + deps))
                 existing.consecutive_fails = 0
                 self.save()
                 return existing
         sid = "skill_{}_{}".format(int(time.time() * 1000), len(self.skills))
-        s = Skill({"id": sid, "task": task, "files": files, "test_cmd": test_cmd})
+        s = Skill({"id": sid, "task": task, "files": files,
+                   "test_cmd": test_cmd, "depends_on": deps})
         self.skills[sid] = s
         self.save()
         return s
@@ -118,7 +143,48 @@ class SkillStore:
             return best
         return None
 
+    def files_of(self, skill: Skill) -> List[dict]:
+        """技能的完整文件集 = 递归依赖文件（先写）+ 自身文件（后写、可覆盖同名）。
+
+        环安全（访问集）+ 深度上限。依赖退役仍返回其文件（档案保留）——
+        上层技能接管时测试若因此失败，record(False) 累积到退役，触发级联重学。
+        """
+        out: List[dict] = []
+        seen_paths: set = set()
+
+        def collect(s: Skill, depth: int, visiting: set) -> None:
+            if depth > MAX_DEP_DEPTH or s.id in visiting:
+                return
+            visiting.add(s.id)
+            for dep_id in s.depends_on:
+                dep = self.skills.get(dep_id)
+                if dep is not None:
+                    collect(dep, depth + 1, visiting)
+            for f in s.files:
+                if f["path"] not in seen_paths:
+                    seen_paths.add(f["path"])
+                    out.append(f)
+            visiting.discard(s.id)
+
+        collect(skill, 0, set())
+        # 自身文件最后写（覆盖依赖同名）——按写入顺序返回
+        own = [f for f in skill.files]
+        deps_flat = [f for f in out if f not in own or True]
+        # 简化：out 已按依赖先、自身后收集；确保自身在最后
+        result = [f for f in out]
+        own_paths = {f["path"] for f in own}
+        result = [f for f in result if f["path"] not in own_paths] + own
+        return result
+
+    def find_by_module(self, module: str) -> Optional[Skill]:
+        """按可 import 模块名找提供该模块的（活跃）技能。"""
+        for s in self.skills.values():
+            if not s.retired and module in s.module_names():
+                return s
+        return None
+
     def stats(self) -> dict:
         active = [s for s in self.skills.values() if not s.retired]
+        deps = sum(len(s.depends_on) for s in active)
         return {"total": len(self.skills), "active": len(active),
-                "retired": len(self.skills) - len(active)}
+                "retired": len(self.skills) - len(active), "dep_links": deps}

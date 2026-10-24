@@ -1,0 +1,192 @@
+// ============================================================================
+// harness/codedojo.hsl — CodeDojo 主循环的自举 harness
+// ============================================================================
+// 用 HSL 描述 CodeDojo 的架构（所有专业装进一个 AI 的那张图）：
+//   router ──on SkillHit──> skill_exec ──on Verified──> judge
+//   router ──on Teach─────> llm_gen ────on Drafted───> verify
+//   verify ──on Pass（验证门）──> isolation（挂载为技能）
+//   verify ──on Fail（回喂修复，预算内）──> llm_gen
+//   judge ──on Pass/Fail ──> router（下一任务，受控环）
+//   isolation ──on Mounted──> router（新专业入场，AI 多一门手艺）
+//
+// 运行（剧本驱动：任务1 无技能走教师并挂载；任务2 命中技能零教师）：
+//   bun dhv-ts/src/main.ts run harness/codedojo.hsl --fixture harness/fix-codedojo.json --quiet
+// ============================================================================
+
+export struct DojoState {
+    task: String,
+    tasks_done: i64,
+    teacher_calls: i64,
+    skill_hits: i64,
+    mounted: i64,
+    summary: String,
+}
+
+export enum Route {
+    SkillHit { family: String },
+    Teach { reason: String },
+}
+
+export enum Draft {
+    Drafted { plan: String },
+    Pass { skill: String },
+    Fail { reason: String },
+}
+
+export enum Verdict {
+    Pass { skill: String },
+    Fail { reason: String },
+}
+
+export enum Mount {
+    Mounted { skill: String },
+    Rejected { reason: String },
+}
+
+fn route_of(task: String, mounted_json: String) -> Route {
+    let hit: String = native typescript {
+        const mounted = JSON.parse(mounted_json);   // {skillId: [关键词...]}
+        let best = "", bestScore = 0;
+        for (const [skill, kws] of Object.entries(mounted)) {
+            let score = 0;
+            for (const kw of kws) { if (String(task).includes(kw)) score += 2; }
+            if (score > bestScore) { bestScore = score; best = skill; }
+        }
+        return bestScore >= 4 && best ? best : "";
+    };
+    if hit == String::from("") {
+        Route::Teach { reason: String::from("无覆盖：教师出场") }
+    } else {
+        Route::SkillHit { family: hit }
+    }
+}
+
+fn gen_of(task: String) -> Draft {
+    Draft::Drafted { plan: format!("教师草案 for {}", task) }
+}
+
+fn verify_of(draft: Draft) -> Verdict {
+    match draft {
+        Draft::Drafted { plan: _ } => Verdict::Pass { skill: String::from("new_skill") },
+        Draft::Pass { skill } => Verdict::Pass { skill },
+        Draft::Fail { reason } => Verdict::Fail { reason },
+    }
+}
+
+// ---------------------------------------------------------------- 拓扑层
+graph CodeDojo(mut state: DojoState) -> DojoState {
+    node router: String = String::from("技能匹配 -> SkillHit/Teach");
+    node skill_exec: String = String::from("技能沙箱重验（零教师）");
+    node llm_gen: String = String::from("教师生成实现+测试");
+    node verify: String = String::from("pytest 验证门");
+    node judge: String = String::from("判分：测试通过即对");
+    node isolation: String = String::from("挂载为技能（HSL 契约）");
+
+    edge router -> skill_exec on Route::SkillHit;
+    edge router -> llm_gen on Route::Teach;
+    edge llm_gen -> verify on Draft::Drafted;
+    edge skill_exec -> judge on Verdict::Pass;
+    edge verify -> isolation on Verdict::Pass;
+    edge verify -> llm_gen on Verdict::Fail;
+    edge judge -> router on Verdict::Pass;
+    edge judge -> router on Verdict::Fail;
+    edge isolation -> router on Mount::Mounted;
+
+    let mut mounted_json: String = String::from("{}");
+    let mut next_task: String = native typescript {
+        return await $host.fixture.nextAct();
+    };
+
+    loop {
+        if state.tasks_done >= 8 {
+            break;
+        }
+        if next_task.contains("\"done\"") {
+            break;
+        }
+        state.task = next_task.clone();
+        let verdict = route_of(state.task.clone(), mounted_json.clone());
+        let outcome = match verdict {
+            Route::SkillHit { family } => {
+                state.skill_hits += 1;
+                println!("[codedojo] 技能命中 {} -> 沙箱重验 -> 交付", family);
+                Verdict::Pass { skill: family }
+            },
+            Route::Teach { reason: _ } => {
+                state.teacher_calls += 1;
+                println!("[codedojo] 教师生成（{}）", state.task);
+                let draft = gen_of(state.task.clone());
+                match draft {
+                    Draft::Drafted { plan: _ } => {
+                        let v = verify_of(draft);
+                        match v {
+                            Verdict::Pass { skill } => {
+                                println!("[codedojo] 验证门通过 -> 挂载技能 + HSL 契约");
+                                state.mounted += 1;
+                                mounted_json = native typescript {
+                                    const mounted = JSON.parse(mounted_json);
+                                    const kw = { skill_1: ["词频", "统计", "单词"], skill_2: ["回文", "判断"] };
+                                    const seed = { skill_1: ["词频", "统计", "单词"] };
+                                    const pick = Object.keys(mounted).length === 0 ? seed : kw;
+                                    for (const [k, v] of Object.entries(pick)) {
+                                        if (!mounted[k]) mounted[k] = v;
+                                    }
+                                    return JSON.stringify(mounted);
+                                };
+                                Verdict::Pass { skill }
+                            },
+                            Verdict::Fail { reason } => Verdict::Fail { reason },
+                        }
+                    },
+                    Draft::Pass { skill } => Verdict::Pass { skill },
+                    Draft::Fail { reason } => Verdict::Fail { reason },
+                }
+            },
+        };
+        match outcome {
+            Verdict::Pass { skill: _ } => {
+                state.tasks_done += 1;
+                next_task = native typescript {
+                    return await $host.fixture.nextAct();
+                };
+            },
+            Verdict::Fail { reason } => {
+                println!("[codedojo] 失败回喂修复: {}", reason);
+                state.tasks_done += 1;
+                next_task = native typescript {
+                    return await $host.fixture.nextAct();
+                };
+            },
+        }
+    }
+
+    state.summary = format!(
+        "tasks={} skill_hits={} teacher_calls={} mounted={}",
+        state.tasks_done, state.skill_hits, state.teacher_calls, state.mounted
+    );
+    state
+}
+
+export fn main() -> Result<(), String> {
+    let state = DojoState {
+        task: String::from("(start)"),
+        tasks_done: 0,
+        teacher_calls: 0,
+        skill_hits: 0,
+        mounted: 0,
+        summary: String::from(""),
+    };
+    let final_state = CodeDojo::run(state);
+    println!("[codedojo] 指标 {}", final_state.summary);
+    let _ = native typescript {
+        $host.events.emit("codedojo_summary", { summary: final_state.summary });
+        return true;
+    };
+    Ok(())
+}
+
+scale = microkernel;
+
+project {
+    CodeDojo -> "src/codedojo/main.py" : python,
+}

@@ -58,6 +58,7 @@ class MockLLM(LLM):
 @pytest.fixture
 def tmp_store(tmp_path, monkeypatch):
     monkeypatch.setattr("codedojo.skills.STORE", tmp_path / "skills.json")
+    monkeypatch.setattr("codedojo.hsl_bridge.CONTRACT_DIR", tmp_path / "contracts")
     return SkillStore(tmp_path / "skills.json")
 
 
