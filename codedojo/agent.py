@@ -148,7 +148,7 @@ class Agent:
                 "{\"relevant\": true/false, \"reason\": \"一句话\"}"},
             {"role": "user", "content":
                 "任务：{}\n技能能力：{}\n技能文件：{}".format(task, caps, files_list)},
-        ], temperature=0.0)
+        ], temperature=0.0, thinking=False, max_tokens=2048)
         if not data or "relevant" not in data:
             return None
         return bool(data["relevant"])

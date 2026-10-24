@@ -22,28 +22,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v5
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+          enable-cache: true
 
-      - name: Install deps
-        run: |
-          python -m pip install --upgrade pip
-          pip install pytest openai pystray pillow
+      - name: Sync deps (uv)
+        run: uv sync --extra desktop
 
       - name: Offline test suite (no API key needed)
         env:
           # 明确无 key：验证降级路径（严闸、裁判跳过）
           DEEPSEEK_API_KEY: ''
-        run: python -m pytest tests/ -v --tb=short
+        run: uv run pytest tests/ -v --tb=short
 
       - name: CLI smoke (degraded, no key)
         env:
           DEEPSEEK_API_KEY: ''
         shell: bash
         run: |
-          python -m codedojo.cli "写一个函数统计文本词频，附带测试" && exit 1 || true
+          uv run python -m codedojo.cli "写一个函数统计文本词频，附带测试" && exit 1 || true
           echo "degraded path OK (exit != 0 expected without key)"
 
   hsl-contracts:

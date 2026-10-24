@@ -48,10 +48,11 @@ class MockLLM(LLM):
         self.judge_calls = 0
         self.judge_verdict = True   # 裁判默认放行；测试可改 False 验证拦截
 
-    def chat_json(self, messages, temperature=0.2):
+    def chat_json(self, messages, temperature=0.2, thinking=None, max_tokens=None):
         self.calls += 1
-        self.tokens_in += 100
+        self.tokens_in_miss += 100
         self.tokens_out += 100
+        self.cost_usd += 0.000132
         # 裁判调用：自动应答，不消耗生成脚本
         if "能力裁判" in (messages[0]["content"] if messages else ""):
             self.judge_calls += 1

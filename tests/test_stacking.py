@@ -40,7 +40,7 @@ class MockLLM(LLM):
         self.judge_verdict = True
         self.seen_messages = []
 
-    def chat_json(self, messages, temperature=0.2):
+    def chat_json(self, messages, temperature=0.2, thinking=None, max_tokens=None):
         self.calls += 1
         self.seen_messages.append(messages)
         if "能力裁判" in (messages[0]["content"] if messages else ""):

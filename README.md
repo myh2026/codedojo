@@ -42,20 +42,33 @@ CodeDojo 主循环本身也自举为 HSL harness（`harness/codedojo.hsl`，
 - **CLI 同引擎**：`python -m codedojo.cli "任务"` 无头使用；
 - **成本可观测**：每次任务报告 LLM 调用数与 token。
 
-## 快速开始
+## 快速开始（uv）
 
 ```bash
-pip install openai pystray pillow pytest
+uv sync --extra desktop
 
-# CLI 模式
+# CLI 模式（默认教师 deepseek-flash = DeepSeek-V4.1-Flash-1017）
 set DEEPSEEK_API_KEY=sk-...
-python -m codedojo.cli "写一个函数统计文本文件词频，附带 pytest 测试"
+uv run python -m codedojo.cli "写一个函数统计文本文件词频，附带 pytest 测试"
 
 # 桌面模式（托盘常驻）
-python -m codedojo.desktop
+uv run python -m codedojo.desktop
 
-# 离线测试（无需 API key，19 项）
-python -m pytest tests/
+# 离线测试（无需 API key，33 项）
+uv run pytest tests/
+
+# 换教师模型
+set DEEPSEEK_MODEL=deepseek-flash   # 或任意可用模型 ID
+```
+
+## 蒸馏战役（distill_campaign）
+
+七阶段全流程战役（规程见 [docs/DISTILL_PLAN.md](docs/DISTILL_PLAN.md)）：
+教学 12 族 → 换措辞接管 → 组合叠加 → 保留集（防误接管金标准）→
+教师/技能双路径对照 → 成本与缓存命中率账本。预算硬闸默认 $2。
+
+```bash
+DEEPSEEK_API_KEY=sk-... uv run python demos/distill_campaign.py
 ```
 
 数据目录：`~/.codedojo/`（skills.json 技能库与依赖 / skills_hsl/ HSL 契约 /

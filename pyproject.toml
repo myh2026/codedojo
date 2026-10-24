@@ -13,6 +13,8 @@ dependencies = ["openai>=1.0"]
 
 [project.optional-dependencies]
 desktop = ["pystray", "pillow"]
+
+[dependency-groups]
 dev = ["pytest"]
 
 [project.scripts]
