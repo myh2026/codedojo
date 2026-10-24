@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Py${{ matrix.python-version }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ['3.9', '3.12']
+        exclude:
+          # Windows 上 3.9 已在本机长期验证；CI 重点覆盖 linux + 新版本
+          - os: windows-latest
+            python-version: '3.9'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest openai pystray pillow
+
+      - name: Offline test suite (no API key needed)
+        env:
+          # 明确无 key：验证降级路径（严闸、裁判跳过）
+          DEEPSEEK_API_KEY: ''
+        run: python -m pytest tests/ -v --tb=short
+
+      - name: CLI smoke (degraded, no key)
+        env:
+          DEEPSEEK_API_KEY: ''
+        shell: bash
+        run: |
+          python -m codedojo.cli "写一个函数统计文本词频，附带测试" && exit 1 || true
+          echo "degraded path OK (exit != 0 expected without key)"
+
+  hsl-contracts:
+    name: HSL contract gate (dhv-ts check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Clone HSL toolchain (vendored, depth 1)
+        run: |
+          mkdir -p vendor
+          git clone --depth 1 https://github.com/myh2026/harness-specification-language.git vendor/hsl
+
+      - name: Check self-hosting harness
+        run: |
+          bun vendor/hsl/toolchain/dhv-ts/src/main.ts check harness/codedojo.hsl
+
+      - name: Check skill contract template (generated from a sample skill)
+        shell: python
+        run: |
+          import sys, subprocess, tempfile, os
+          sys.path.insert(0, '.')
+          # 隔离 HOME，避免污染真实 ~/.codedojo
+          tmp = tempfile.mkdtemp()
+          os.environ['HOME'] = tmp
+          os.environ['USERPROFILE'] = tmp
+          from codedojo.skills import SkillStore, Skill
+          from codedojo.hsl_bridge import skill_to_hsl
+          import pathlib
+          store_path = pathlib.Path(tmp) / 'skills.json'
+          store = SkillStore(store_path)
+          s = store.mount('CI 契约模板校验：统计文本词频', [
+              {'path': 'wc.py', 'content': 'def f():\n    return 1\n'},
+              {'path': 'tests/test_wc.py', 'content': 'from wc import f\n\ndef test_f():\n    assert f() == 1\n'},
+          ], 'python -m pytest -q', capabilities=['统计词频'])
+          text = skill_to_hsl(s)
+          out = pathlib.Path(tmp) / 'ci_contract.hsl'
+          out.write_text(text, encoding='utf-8')
+          proc = subprocess.run(
+              ['bun', 'vendor/hsl/toolchain/dhv-ts/src/main.ts', 'check', str(out)],
+              capture_output=True, text=True, timeout=120)
+          print(proc.stdout, proc.stderr)
+          assert proc.returncode == 0 and '0 error' in proc.stdout, 'HSL contract FAILED'
+
+      - name: Run self-hosting harness (fixture)
+        run: |
+          bun vendor/hsl/toolchain/dhv-ts/src/main.ts run harness/codedojo.hsl \
+            --fixture harness/fix-codedojo.json --quiet

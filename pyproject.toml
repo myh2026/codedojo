@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codedojo"
+version = "0.2.0"
+description = "Desktop coding agent: LLM teaches, sandbox verifies, skills take over with zero generation calls (GraphDojo lineage)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = ["openai>=1.0"]
+
+[project.optional-dependencies]
+desktop = ["pystray", "pillow"]
+dev = ["pytest"]
+
+[project.scripts]
+codedojo = "codedojo.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["codedojo*"]

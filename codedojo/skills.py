@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 STORE = Path.home() / ".codedojo" / "skills.json"
 MATCH_THRESHOLD = 0.42   # 重叠系数阈值（交集/较短方，适合长短不一的任务文本）
 JACCARD_FLOOR = 0.42     # Jaccard 下限（严闸：离线无裁判时的唯一防线）
-JACCARD_FLOOR_SOFT = 0.25  # 软闸（LLM 裁判可用时：软召回 + 裁判精判）
+DICE_FLOOR_SOFT = 0.26   # Dice 软闸（LLM 裁判可用时：稳健召回 + 裁判精判）
 RETIRE_AFTER_FAILS = 3   # 连续失败 N 次退役
 MAX_DEP_DEPTH = 4        # 依赖递归深度上限
 
@@ -100,6 +100,24 @@ class Skill:
             return 0.0
         return inter / len(self._tokens | other)
 
+    def dice_score(self, task_text: str) -> float:
+        """Dice：2|A∩B| / (|A|+|B|)——对任务长度差稳健的召回度量。
+
+        与 Jaccard 单调等价（Dice = 2J/(1+J)）但对短查询更友好。
+        关键场景（教学文本 25 词 vs 换措辞 10 词，交集 5）：
+        Jaccard = 5/30 = 0.17（被长短差稀释，误杀真同族）；
+        Dice    = 10/35 = 0.29（交集计双倍，真同族召回）。
+        需求超集（7 交 / 8 vs 16 词）Dice = 14/24 = 0.58 偏高——
+        超集精判交给能力裁判，Dice 只做召回。
+        """
+        other = tokenize(task_text)
+        if not other or not self._tokens:
+            return 0.0
+        inter = len(self._tokens & other)
+        if inter < 3:
+            return 0.0
+        return 2.0 * inter / (len(self._tokens) + len(other))
+
     def capability_overlap(self, task_text: str) -> bool:
         """能力签名与新任务有内容词相交（注册表过滤用）。"""
         if not self._cap_tokens:
@@ -172,13 +190,17 @@ class SkillStore:
         return s
 
     def match(self, task_text: str, soft: bool = False) -> Optional[Skill]:
-        """最佳匹配技能（非退役、双闸门：重叠系数 + Jaccard 下限）。
+        """最佳匹配技能（非退役、双闸门：重叠系数 + 第二系数下限）。
 
-        soft=True（LLM 裁判在场）：软闸只做廉价召回，语义精度交给裁判——
-        换措辞的真同族任务（Jaccard 0.25~0.42）能进入裁决而非被词面误杀；
-        soft=False（离线）：严闸是唯一防线，宁缺勿滥。
+        soft=True（LLM 裁判在场）：Dice 软闸（0.26）只做廉价召回——对任务
+        长度差稳健，换措辞的真同族（教学长文本 vs 简短查询）能进入裁决；
+        语义精度（需求超集）交给能力裁判。
+        soft=False（离线）：Jaccard 严闸是唯一防线，宁缺勿滥。
         """
-        floor = JACCARD_FLOOR_SOFT if soft else JACCARD_FLOOR
+        use_dice = soft
+        floor = DICE_FLOOR_SOFT if soft else JACCARD_FLOOR
+        gate = (lambda s: s.dice_score(task_text)) if use_dice else (
+            lambda s: s.jaccard_score(task_text))
         best, best_score = None, 0.0
         for s in self.skills.values():
             if s.retired:
@@ -186,7 +208,7 @@ class SkillStore:
             sc = s.match_score(task_text)
             if sc < MATCH_THRESHOLD:
                 continue
-            if s.jaccard_score(task_text) < floor:
+            if gate(s) < floor:
                 continue
             if sc > best_score:
                 best, best_score = s, sc
