@@ -61,14 +61,20 @@ uv run pytest tests/
 set DEEPSEEK_MODEL=deepseek-flash   # 或任意可用模型 ID
 ```
 
-## 蒸馏战役（distill_campaign）
+## 蒸馏战役（distill_campaign，已实测）
 
-七阶段全流程战役（规程见 [docs/DISTILL_PLAN.md](docs/DISTILL_PLAN.md)）：
-教学 12 族 → 换措辞接管 → 组合叠加 → 保留集（防误接管金标准）→
-教师/技能双路径对照 → 成本与缓存命中率账本。预算硬闸默认 $2。
+七阶段全流程战役（规程 [docs/DISTILL_PLAN.md](docs/DISTILL_PLAN.md)，
+结果 [distill_campaign_results.md](distill_campaign_results.md)），
+deepseek-v4.1-flash-1017 教师实测（38 任务全成、总成本 **$0.17**、缓存命中 22%）：
+
+- 换措辞零生成接管率 42%（5/12 首拍接管；未接管者教师重挂载后下拍即接管）
+- 保留集（4 个全新族）**零误接管**——防过度泛化金标准
+- 组合叠加 **4/4** 复用已挂专家（依赖边入库）
+- **蒸馏对照**：技能接管比教师直解**延迟 1.9×、成本 38.4×** 便宜
+  （$0.00008 vs $0.0032/任务；技能路径秒数含沙箱 pytest 重验）
 
 ```bash
-DEEPSEEK_API_KEY=sk-... uv run python demos/distill_campaign.py
+DEEPSEEK_API_KEY=sk-... uv run python demos/distill_campaign.py [--only-p5] [--budget 2.0]
 ```
 
 数据目录：`~/.codedojo/`（skills.json 技能库与依赖 / skills_hsl/ HSL 契约 /

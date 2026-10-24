@@ -84,7 +84,18 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--budget", type=float, default=2.0)
     ap.add_argument("--fresh", action="store_true")
+    ap.add_argument("--only-p5", action="store_true",
+                    help="断点续跑：加载既有战役结果，只补 P5 对照并重算汇总")
     args = ap.parse_args()
+
+    prev_rows = []
+    if args.only_p5:
+        prev_path = ROOT / "distill_campaign_results.json"
+        if prev_path.exists():
+            data = json.loads(prev_path.read_text(encoding="utf-8"))
+            prev_rows = [r for r in data.get("rows", [])
+                         if r["phase"] not in ("duel_skill", "duel_teacher")]
+            print("[campaign] 续跑：加载既有 {} 行".format(len(prev_rows)))
 
     if args.fresh:
         p = Path.home() / ".codedojo" / "skills.json"
@@ -99,7 +110,8 @@ def main():
     print("[campaign] 教师模型：{}（预算闸 ${:.2f}）".format(llm.model, args.budget))
 
     agent = Agent(llm, SkillStore(), log=lambda m: print("  " + m, flush=True))
-    rows = []
+    rows = list(prev_rows)
+    duels = []
 
     def run_one(phase, family, task):
         before = llm.cost()
@@ -130,38 +142,37 @@ def main():
     try:
         # P0 自检
         print("\n== P0 模型自检 ==")
-        pong = llm.chat_json([{"role": "user", "content": '输出 {"pong": true}'}],
+        pong = llm.chat_json([{"role": "user", "content": '输出一个 JSON 对象：{"pong": true}'}],
                              thinking=False, max_tokens=64)
         print("  P0: {} | 模型 {} | 成本 ${:.6f}".format(
             "OK" if pong else "FAIL", llm.model, llm.cost_usd))
 
-        # P1 教学
-        print("\n== P1 教学（12 族）==")
-        for fam, teach, _ in TEACH:
-            run_one("teach", fam, teach)
+        if not args.only_p5:
+            # P1 教学
+            print("\n== P1 教学（12 族）==")
+            for fam, teach, _ in TEACH:
+                run_one("teach", fam, teach)
 
-        # P2 换措辞
-        print("\n== P2 换措辞接管（12 族）==")
-        for fam, _, quiz in TEACH:
-            run_one("rephrase", fam, quiz)
+            # P2 换措辞
+            print("\n== P2 换措辞接管（12 族）==")
+            for fam, _, quiz in TEACH:
+                run_one("rephrase", fam, quiz)
 
-        # P3 叠加
-        print("\n== P3 组合叠加（4 任务）==")
-        for fam, task in COMPOSITES:
-            run_one("composite", fam, task)
+            # P3 叠加
+            print("\n== P3 组合叠加（4 任务）==")
+            for fam, task in COMPOSITES:
+                run_one("composite", fam, task)
 
-        # P4 保留集
-        print("\n== P4 保留集（4 个全新族，应零误接管）==")
-        for fam, task in HOLDOUT:
-            run_one("holdout", fam, task)
+            # P4 保留集
+            print("\n== P4 保留集（4 个全新族，应零误接管）==")
+            for fam, task in HOLDOUT:
+                run_one("holdout", fam, task)
 
         # P5 蒸馏对照
         print("\n== P5 蒸馏对照（教师直解 vs 技能接管）==")
-        duels = []
-        for fam, teach, _ in TEACH:
-            if fam not in DUEL_FAMILIES:
-                continue
-            quiz = dict(TEACH)[fam]  # 换措辞文本
+        quiz_by_fam = {t[0]: t[2] for t in TEACH}
+        for fam in DUEL_FAMILIES:
+            quiz = quiz_by_fam[fam]
             # 路径 A：技能接管（正常 agent）
             ra = run_one("duel_skill", fam + "/skill", quiz)
             # 路径 B：教师直解（干净沙箱：临时禁用匹配）
