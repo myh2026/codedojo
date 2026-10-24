@@ -31,6 +31,7 @@ SYSTEM_PROMPT = """你是 CodeDojo 的编码引擎，在 Windows 沙箱里完成
   "plan": "一两句实现思路",
   "files": [{"path": "相对路径.py", "content": "完整文件内容"}],
   "test_cmd": "python -m pytest -q",
+  "capabilities": ["这个技能能做什么（一句话/条，含适用范围与限制，如'单个罗马数字字符串转整数'）"],
   "imports": ["你复用的专家技能 id"]
 }
 
@@ -87,15 +88,21 @@ class Agent:
         self._log = log or (lambda msg: None)
 
     # ------------------------------------------------------------ 专家注册表
-    def _registry_text(self) -> str:
-        """已挂载专家清单（给教师看）：id / 任务 / 模块名 / 源码（预算内）。"""
-        actives = [s for s in self.store.skills.values() if not s.retired]
+    def _registry_text(self, task: str) -> str:
+        """已挂载专家清单（给教师看）：id / 任务 / 模块名 / 源码（预算内）。
+
+        按能力相关性过滤：能力签名与新任务无内容词交集的专家不进注册表
+        （防止教师为无关任务"复用"无关专家，产生冗余依赖链）。
+        """
+        actives = [s for s in self.store.skills.values()
+                   if not s.retired and s.capability_overlap(task)]
         if not actives:
             return ""
         parts, budget = [], REGISTRY_BUDGET
         for s in actives:
-            entry = "专家 {}: {}（任务：{}）".format(s.id, ", ".join(sorted(s.module_names())) or "-",
-                                              s.task[:60])
+            caps = "; ".join(s.capabilities) or s.task[:50]
+            entry = "专家 {}: {}（能力：{}）".format(
+                s.id, ", ".join(sorted(s.module_names())) or "-", caps)
             for f in s.files:
                 if f["path"].startswith("tests/") or not f["path"].endswith(".py"):
                     continue
@@ -110,22 +117,41 @@ class Agent:
 
     def _resolve_dep_ids(self, files: List[dict], declared: Optional[list],
                          exclude_id: Optional[str] = None) -> List[str]:
-        """依赖技能 id = 声明 imports ∪ 代码实际 import 命中的专家模块。
+        """依赖技能 id：**只认地面真值**——代码里实际 import 命中的专家模块。
 
+        声明 imports 仅作参考不入库（教师会声明不相关专家造成冗余依赖链）；
         exclude_id：正被重学的技能自身——新解法 import 自己的模块名是常态
         （重写 topk_words），不能据此把"旧自己"（及其坏依赖）拖进沙箱。
         """
         dep_ids: List[str] = []
-        for d in (declared or []):
-            sid = str(d)
-            if sid != exclude_id and sid in self.store.skills and sid not in dep_ids:
-                dep_ids.append(sid)
         for module in extract_imports(files):
             provider = self.store.find_by_module(module)
             if (provider is not None and provider.id != exclude_id
                     and provider.id not in dep_ids):
                 dep_ids.append(provider.id)
         return dep_ids
+
+    def _judge_relevance(self, task: str, skill) -> Optional[bool]:
+        """LLM 相关性裁判：该技能的能力是否真正满足本任务。
+
+        返回 True（相关，可接管）/ False（不相关，交教师）/ None（裁判
+        不可用，失败放行——保持离线/降级时的零 LLM 接管路径）。
+        """
+        if not self.llm.ready:
+            return None
+        caps = "; ".join(skill.capabilities) or skill.task[:80]
+        files_list = ", ".join(f["path"] for f in skill.files)
+        data = self.llm.chat_json([
+            {"role": "system", "content":
+                "你是能力裁判。判断给定技能的能力是否满足任务的全部要求"
+                "(包括批量/求和/排序等附加要求)。严格输出 JSON："
+                "{\"relevant\": true/false, \"reason\": \"一句话\"}"},
+            {"role": "user", "content":
+                "任务：{}\n技能能力：{}\n技能文件：{}".format(task, caps, files_list)},
+        ], temperature=0.0)
+        if not data or "relevant" not in data:
+            return None
+        return bool(data["relevant"])
 
     def _dep_files(self, dep_ids: List[str]) -> List[dict]:
         """依赖技能的完整文件集（含传递依赖），供沙箱写入。"""
@@ -146,8 +172,13 @@ class Agent:
         start = time.perf_counter()
         task_id = "t_" + uuid.uuid4().hex[:10]
 
-        # 1) 技能接管（GraphDojo 的"图"）：匹配 -> 带依赖重验 -> 直接用
-        skill = self.store.match(task)
+        # 1) 技能接管（GraphDojo 的"图"）：软闸召回 -> 相关性裁判 -> 带依赖重验
+        skill = self.store.match(task, soft=self.llm.ready)
+        if skill is not None:
+            verdict = self._judge_relevance(task, skill)
+            if verdict is False:
+                self._log("[dojo] 裁判：技能能力不覆盖本任务，交教师")
+                skill = None
         if skill is not None:
             self._log("[dojo] 技能命中 {}（uses={}，依赖 {}）→ 重验".format(
                 skill.id, skill.uses, len(skill.depends_on)))
@@ -158,12 +189,14 @@ class Agent:
                 if r["ok"]:
                     skill.record(True)
                     self.store.save()
-                    self._log("[dojo] 技能验证通过，零 LLM 接管")
+                    self._log("[dojo] 技能验证通过，零生成接管（裁判 {} 次）".format(
+                        self.llm.calls))
                     return TaskResult(
                         task=task, ok=True, source="skill", skill_id=skill.id,
                         files=skill.files, test_output=r["stdout"],
                         elapsed_ms=(time.perf_counter() - start) * 1000,
-                        depends_on=skill.depends_on)
+                        depends_on=skill.depends_on,
+                        llm_calls=self.llm.calls, tokens=self.llm.cost())
                 # 验证失败：技能失效（环境变迁或底层依赖退役），走教师重学
                 skill.record(False)
                 self.store.save()
@@ -177,7 +210,7 @@ class Agent:
                               error="无匹配技能且缺少 DEEPSEEK_API_KEY",
                               elapsed_ms=(time.perf_counter() - start) * 1000)
 
-        registry = self._registry_text()
+        registry = self._registry_text(task)
         first_user = "任务：{}".format(task)
         if registry:
             first_user += "\n\n=== 已挂载专家（可 import 复用，在 imports 里声明）===\n" + registry
@@ -214,7 +247,9 @@ class Agent:
                 if r["ok"]:
                     result.ok = True
                     # 3) 挂载：验证通过的解法成为技能（记录依赖）+ HSL 契约
-                    skill = self.store.mount(task, files, test_cmd, depends_on=dep_ids)
+                    skill = self.store.mount(
+                        task, files, test_cmd, depends_on=dep_ids,
+                        capabilities=[str(c) for c in (data.get("capabilities") or [])])
                     skill.depends_on = [d for d in skill.depends_on if d != skill.id]
                     self.store.save()
                     result.skill_id = skill.id

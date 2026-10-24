@@ -44,11 +44,19 @@ class MockLLM(LLM):
         super().__init__(api_key="mock-key")
         self.script = list(script)
         self.calls = 0
+        self.gen_calls = 0
+        self.judge_calls = 0
+        self.judge_verdict = True   # 裁判默认放行；测试可改 False 验证拦截
 
     def chat_json(self, messages, temperature=0.2):
         self.calls += 1
         self.tokens_in += 100
         self.tokens_out += 100
+        # 裁判调用：自动应答，不消耗生成脚本
+        if "能力裁判" in (messages[0]["content"] if messages else ""):
+            self.judge_calls += 1
+            return {"relevant": self.judge_verdict, "reason": "mock"}
+        self.gen_calls += 1
         if not self.script:
             return None
         item = self.script.pop(0)
@@ -139,16 +147,42 @@ def test_agent_fix_loop_recovers(tmp_store):
 
 
 def test_agent_skill_takeover_zero_llm(tmp_store):
-    """核心主张：技能命中 → 零 LLM 调用。"""
+    """核心主张：技能命中 → 零**生成** LLM 调用（至多一次轻量裁判，失败放行）。"""
     llm = MockLLM([GOOD_SOLUTION])
     agent = Agent(llm, tmp_store)
     r1 = agent.run_task("写一个函数统计文本词频，附带 pytest 测试")
     assert r1.ok and r1.source == "llm"
-    calls_after_first = llm.calls
+    assert llm.gen_calls == 1
 
-    llm2 = MockLLM([])   # 再无脚本：若走了 LLM 会失败
+    llm2 = MockLLM([])   # 生成脚本为空：若走生成路径会失败
     agent2 = Agent(llm2, tmp_store)
     r2 = agent2.run_task("统计文本词频的函数，带测试")
     assert r2.ok and r2.source == "skill"
-    assert llm2.calls == 0
-    assert calls_after_first == 1
+    assert llm2.gen_calls == 0
+    assert llm2.judge_calls <= 1   # 裁判至多一次
+
+
+def test_judge_blocks_irrelevant_takeover(tmp_store):
+    """裁判拦截：措辞相近但能力不覆盖的任务不被接管，交教师重解。"""
+    llm = MockLLM([GOOD_SOLUTION])
+    agent = Agent(llm, tmp_store)
+    r1 = agent.run_task("写一个函数统计文本词频，附带 pytest 测试")
+    assert r1.ok
+    # 第二次：裁判判"不相关"→ 不接管 → 教师生成闰年解
+    leap = {
+        "plan": "闰年判断",
+        "files": [
+            {"path": "leap.py",
+             "content": "def is_leap(y):\n    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)\n"},
+            {"path": "tests/test_leap.py",
+             "content": "from leap import is_leap\n\ndef test_leap():\n    assert is_leap(2000) and not is_leap(1900) and is_leap(2024)\n"},
+        ],
+        "test_cmd": "python -m pytest -q",
+    }
+    llm2 = MockLLM([leap])
+    llm2.judge_verdict = False
+    agent2 = Agent(llm2, tmp_store)
+    # 措辞同族（能过双闸门），但裁判判能力不覆盖 → 拦截接管，交教师
+    r2 = agent2.run_task("统计文本词频的函数，带测试")
+    assert r2.ok and r2.source == "llm"
+    assert llm2.judge_calls >= 1

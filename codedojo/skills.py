@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 STORE = Path.home() / ".codedojo" / "skills.json"
 MATCH_THRESHOLD = 0.42   # 重叠系数阈值（交集/较短方，适合长短不一的任务文本）
+JACCARD_FLOOR = 0.42     # Jaccard 下限（严闸：离线无裁判时的唯一防线）
+JACCARD_FLOOR_SOFT = 0.25  # 软闸（LLM 裁判可用时：软召回 + 裁判精判）
 RETIRE_AFTER_FAILS = 3   # 连续失败 N 次退役
 MAX_DEP_DEPTH = 4        # 依赖递归深度上限
 
@@ -43,6 +45,7 @@ class Skill:
         self.files: List[dict] = data["files"]            # [{path, content}]
         self.test_cmd: str = data.get("test_cmd", "python -m pytest -q")
         self.depends_on: List[str] = list(data.get("depends_on", []))  # 依赖的技能 id
+        self.capabilities: List[str] = list(data.get("capabilities", []))  # 能力签名（教师生成）
         self.uses: int = data.get("uses", 0)
         self.successes: int = data.get("successes", 0)
         self.fails: int = data.get("fails", 0)
@@ -50,10 +53,14 @@ class Skill:
         self.retired: bool = data.get("retired", False)
         self.created: float = data.get("created", time.time())
         self._tokens = tokenize(self.task)
+        self._cap_tokens = set()
+        for cap in self.capabilities:
+            self._cap_tokens |= tokenize(cap)
 
     def to_dict(self) -> dict:
         return {"id": self.id, "task": self.task, "files": self.files,
                 "test_cmd": self.test_cmd, "depends_on": self.depends_on,
+                "capabilities": self.capabilities,
                 "uses": self.uses, "successes": self.successes, "fails": self.fails,
                 "consecutive_fails": self.consecutive_fails,
                 "retired": self.retired, "created": self.created}
@@ -76,6 +83,28 @@ class Skill:
         if inter < 3:          # 至少 3 个共同关键词
             return 0.0
         return inter / min(len(self._tokens), len(other))
+
+    def jaccard_score(self, task_text: str) -> float:
+        """Jaccard：|A∩B| / |A∪B|——惩罚"需求超集"。
+
+        反例（重叠系数的盲区）：技能"罗马数字转整数"（8 个内容词）vs
+        任务"批量把一组罗马数字全部转换成整数并求和"（16 个内容词）——
+        重叠系数 7/8=0.88 误判同族；Jaccard 7/17=0.41 揭示任务多出
+        "批量/一组/求和"等新需求，应交教师而非接管。
+        """
+        other = tokenize(task_text)
+        if not other or not self._tokens:
+            return 0.0
+        inter = len(self._tokens & other)
+        if inter < 3:
+            return 0.0
+        return inter / len(self._tokens | other)
+
+    def capability_overlap(self, task_text: str) -> bool:
+        """能力签名与新任务有内容词相交（注册表过滤用）。"""
+        if not self._cap_tokens:
+            return True   # 旧技能无签名：不过滤
+        return bool(self._cap_tokens & tokenize(task_text))
 
     def record(self, ok: bool) -> None:
         self.uses += 1
@@ -112,36 +141,56 @@ class SkillStore:
                        ensure_ascii=False, indent=2), encoding="utf-8")
 
     def mount(self, task: str, files: List[dict], test_cmd: str,
-              depends_on: Optional[List[str]] = None) -> Skill:
+              depends_on: Optional[List[str]] = None,
+              capabilities: Optional[List[str]] = None) -> Skill:
         """挂载（调用方须已通过验证门）。同族已有技能 -> 原位升级（依赖取并集）。"""
         deps = list(dict.fromkeys(depends_on or []))
+        caps = list(capabilities or [])
         for existing in list(self.skills.values()):
-            if not existing.retired and existing.match_score(task) >= MATCH_THRESHOLD:
+            # 去重合并与接管同一套双闸门：Jaccard 不过 = 能力不同 = 新技能，
+            # 绝不能原位覆盖（否则底层技能文件被换，上层依赖者全遭殃）
+            if (not existing.retired
+                    and existing.match_score(task) >= MATCH_THRESHOLD
+                    and existing.jaccard_score(task) >= JACCARD_FLOOR):
                 existing.files = files
                 existing.test_cmd = test_cmd
                 existing.depends_on = list(dict.fromkeys(existing.depends_on + deps))
+                if caps:
+                    existing.capabilities = caps
+                    existing._cap_tokens = set()
+                    for cap in caps:
+                        existing._cap_tokens |= tokenize(cap)
                 existing.consecutive_fails = 0
                 self.save()
                 return existing
         sid = "skill_{}_{}".format(int(time.time() * 1000), len(self.skills))
         s = Skill({"id": sid, "task": task, "files": files,
-                   "test_cmd": test_cmd, "depends_on": deps})
+                   "test_cmd": test_cmd, "depends_on": deps,
+                   "capabilities": caps})
         self.skills[sid] = s
         self.save()
         return s
 
-    def match(self, task_text: str) -> Optional[Skill]:
-        """最佳匹配技能（非退役、分数过阈值）。"""
+    def match(self, task_text: str, soft: bool = False) -> Optional[Skill]:
+        """最佳匹配技能（非退役、双闸门：重叠系数 + Jaccard 下限）。
+
+        soft=True（LLM 裁判在场）：软闸只做廉价召回，语义精度交给裁判——
+        换措辞的真同族任务（Jaccard 0.25~0.42）能进入裁决而非被词面误杀；
+        soft=False（离线）：严闸是唯一防线，宁缺勿滥。
+        """
+        floor = JACCARD_FLOOR_SOFT if soft else JACCARD_FLOOR
         best, best_score = None, 0.0
         for s in self.skills.values():
             if s.retired:
                 continue
             sc = s.match_score(task_text)
+            if sc < MATCH_THRESHOLD:
+                continue
+            if s.jaccard_score(task_text) < floor:
+                continue
             if sc > best_score:
                 best, best_score = s, sc
-        if best is not None and best_score >= MATCH_THRESHOLD:
-            return best
-        return None
+        return best
 
     def files_of(self, skill: Skill) -> List[dict]:
         """技能的完整文件集 = 递归依赖文件（先写）+ 自身文件（后写、可覆盖同名）。

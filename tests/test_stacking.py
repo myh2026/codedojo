@@ -35,11 +35,18 @@ class MockLLM(LLM):
         super().__init__(api_key="mock")
         self.script = list(script)
         self.calls = 0
+        self.gen_calls = 0
+        self.judge_calls = 0
+        self.judge_verdict = True
         self.seen_messages = []
 
     def chat_json(self, messages, temperature=0.2):
         self.calls += 1
         self.seen_messages.append(messages)
+        if "能力裁判" in (messages[0]["content"] if messages else ""):
+            self.judge_calls += 1
+            return {"relevant": self.judge_verdict, "reason": "mock"}
+        self.gen_calls += 1
         if not self.script:
             return None
         item = self.script.pop(0)
@@ -111,10 +118,11 @@ class TestStackingAgent:
         a = store.mount("写一个函数统计文本词频", SKILL_A_FILES, "python -m pytest -q")
         store.mount("取出现次数前 K 的单词", SKILL_B_FILES, "python -m pytest -q",
                     depends_on=[a.id])
-        llm = MockLLM([])             # 空：若走 LLM 会返回 None 导致失败
+        llm = MockLLM([])             # 生成脚本空：若走生成会失败
         agent = Agent(llm, store)
         r = agent.run_task("取出现次数前 K 的单词的函数")
-        assert r.ok and r.source == "skill" and llm.calls == 0
+        assert r.ok and r.source == "skill" and llm.gen_calls == 0
+        assert llm.judge_calls <= 1
         assert r.depends_on == [a.id]
 
     def test_cascade_relearn_after_base_retires(self, store):
@@ -144,7 +152,7 @@ class TestStackingAgent:
         agent = Agent(llm, store)
         r = agent.run_task("取出现次数前 K 的单词")
         # B 接管验证失败（A 坏了）-> 走教师重学 -> 成功
-        assert r.ok and r.source == "llm" and llm.calls == 1
+        assert r.ok and r.source == "llm" and llm.gen_calls == 1
 
 
 class TestHslContractRegression:
@@ -167,3 +175,50 @@ class TestHslContractRegression:
         s = store.mount("词频统计回归", SKILL_A_FILES, "python -m pytest -q")
         r = hsl_bridge.write_contract(s)
         assert r["check"] == "pass", r
+
+
+class TestGates:
+    """误接管与冗余依赖的修复验证。"""
+
+    def test_dual_gate_rejects_superset_task(self, store):
+        """反例回归：'批量+求和'是'单转换'的需求超集——重叠系数会误放行，
+        Jaccard 下限必须拦下（真实误接管场景）。"""
+        store.mount("写一个函数把罗马数字字符串转换成整数，附带 pytest 测试",
+                    SKILL_A_FILES, "python -m pytest -q")
+        superset = "写一个函数批量把一组罗马数字全部转换成整数并求和（复用已挂载专家的模块），附带 pytest 测试"
+        assert store.match(superset) is None
+        same_family = "把罗马数字字符串转为整数的函数，带测试"
+        assert store.match(same_family) is not None
+
+    def test_declared_deps_without_import_are_dropped(self, store):
+        """声明依赖但代码没 import：不入库（防教师冗余复用）。"""
+        a = store.mount("词频统计", SKILL_A_FILES, "python -m pytest -q")
+        leap = [
+            {"path": "leap.py",
+             "content": "def is_leap(y):\n    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)\n"},
+            {"path": "tests/test_leap.py",
+             "content": "from leap import is_leap\n\ndef test_leap():\n    assert is_leap(2000)\n"},
+        ]
+        llm = MockLLM([{"plan": "闰年", "files": leap, "test_cmd": "python -m pytest -q",
+                         "imports": [a.id]}])   # 声明依赖 A 但没 import 它
+        agent = Agent(llm, store)
+        r = agent.run_task("判断闰年的函数，带测试")
+        assert r.ok
+        assert store.skills[r.skill_id].depends_on == []
+
+    def test_registry_filtered_by_capability(self, store):
+        """注册表按能力相关性过滤：词频专家不进闰年任务的注册表。"""
+        a = store.mount("词频统计", SKILL_A_FILES, "python -m pytest -q",
+                        capabilities=["统计文本中每个单词的出现次数"])
+        agent = Agent(MockLLM([]), store)
+        assert a.id not in agent._registry_text("判断闰年的函数，带测试")
+        assert a.id in agent._registry_text("统计单词出现次数的函数，带测试")
+
+    def test_capabilities_persisted(self, store):
+        store.mount("词频统计", SKILL_A_FILES, "python -m pytest -q",
+                    capabilities=["统计文本词频"])
+        store2 = SkillStore(store.path)
+        s = list(store2.skills.values())[0]
+        assert s.capabilities == ["统计文本词频"]
+        assert s.capability_overlap("统计词频的函数")
+        assert not s.capability_overlap("配置 nginx 反向代理")
